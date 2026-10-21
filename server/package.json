@@ -1,0 +1,22 @@
+{
+  "name": "klyro-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test server.test.js"
+  },
+  "dependencies": {
+    "@eslint/js": "^9.0.0",
+    "@xberg-io/tree-sitter-language-pack-wasm": "^1.22.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "eslint": "^9.0.0",
+    "express": "^4.21.2",
+    "html-validate": "^10.17.0",
+    "mongodb": "^7.7.0",
+    "node-sql-parser": "^5.4.0"
+  }
+}
