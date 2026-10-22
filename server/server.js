@@ -1321,7 +1321,21 @@ async function preparePublicDeployment() {
   return publicInitialization;
 }
 
-export { app, connectMongo, preparePublicDeployment, resetRateLimitsForTests, setAuthCollectionsForTests, setDockerForTests, setMongoForTests, setPublicDeploymentForTests, setRepairProviderForTests, setReviewsCollectionForTests, readiness };
+function getPublicDeploymentDiagnostics() {
+  if (!publicDeployment) {
+    return {
+      ready: false,
+      blockers: ["Set PUBLIC_DEPLOYMENT=true in the Vercel Production environment."],
+    };
+  }
+  const blockers = publicDeploymentProblems();
+  if (mongoStatus !== "connected" || !usersCollection || !sessionsCollection || !authTokensCollection || !rateLimitsCollection) {
+    blockers.push("MongoDB is unavailable or its required account and shared rate-limit collections are not ready. Check MONGODB_URI, database network access, and the deployment logs.");
+  }
+  return { ready: blockers.length === 0, blockers };
+}
+
+export { app, connectMongo, getPublicDeploymentDiagnostics, preparePublicDeployment, resetRateLimitsForTests, setAuthCollectionsForTests, setDockerForTests, setMongoForTests, setPublicDeploymentForTests, setRepairProviderForTests, setReviewsCollectionForTests, readiness };
 
 function setReviewsCollectionForTests(collection) {
   reviewsCollection = collection;
