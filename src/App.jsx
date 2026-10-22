@@ -61,6 +61,15 @@ function writeStoredValue(key, value) {
   }
 }
 
+function getAccountActionFromLocation() {
+  if (typeof window === "undefined") return { action: "", token: "" };
+  const url = new URL(window.location.href);
+  const fragment = new URLSearchParams(url.hash.slice(1));
+  const verifyToken = url.searchParams.get("verifyEmail") || fragment.get("verifyEmail");
+  const resetToken = url.searchParams.get("resetPassword") || fragment.get("resetPassword");
+  return { action: verifyToken ? "verify" : resetToken ? "reset" : "", token: verifyToken || resetToken || "" };
+}
+
 const STARTER_CODE = `function greetUser(user) {
   return "Hello, " + user.name.toUpperCase();
 }
@@ -130,6 +139,7 @@ function getIssueCount(items) {
 }
 
 export default function App() {
+  const [initialAccountAction] = useState(getAccountActionFromLocation);
   const [code, setCode] = useState(STARTER_CODE);
   const [findings, setFindings] = useState([]);
   const [selectedFinding, setSelectedFinding] = useState(null);
@@ -154,9 +164,9 @@ export default function App() {
   const [databaseStatus, setDatabaseStatus] = useState("checking");
   const [profile, setProfile] = useState({ name: "Guest", role: "Student" });
   const [authUser, setAuthUser] = useState(null);
-  const [authDialogOpen, setAuthDialogOpen] = useState(false);
-  const [authAction, setAuthAction] = useState("");
-  const [authActionToken, setAuthActionToken] = useState("");
+  const [authDialogOpen, setAuthDialogOpen] = useState(Boolean(initialAccountAction.token));
+  const [authAction, setAuthAction] = useState(initialAccountAction.action);
+  const [authActionToken, setAuthActionToken] = useState(initialAccountAction.token);
 
   const [toast, setToast] = useState("");
   const [sidebarHidden, setSidebarHidden] = useState(false);
@@ -179,19 +189,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!initialAccountAction.token) return;
     const url = new URL(window.location.href);
-    const verifyToken = url.searchParams.get("verifyEmail");
-    const resetToken = url.searchParams.get("resetPassword");
-    if (!verifyToken && !resetToken) return;
-    const token = verifyToken || resetToken;
-    const action = verifyToken ? "verify" : "reset";
     url.searchParams.delete("verifyEmail");
     url.searchParams.delete("resetPassword");
+    url.hash = "";
     window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
-    setAuthAction(action);
-    setAuthActionToken(token);
-    setAuthDialogOpen(true);
-  }, []);
+  }, [initialAccountAction.token]);
   useEffect(() => writeStoredValue(STORAGE_KEYS.appearance, appearance), [appearance]);
   useEffect(() => writeStoredValue(STORAGE_KEYS.language, language), [language]);
   useEffect(() => {

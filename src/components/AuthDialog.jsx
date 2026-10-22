@@ -17,7 +17,7 @@ export default function AuthDialog({ apiBaseUrl = "/api", initialName = "", init
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(initialAction === "verify" && Boolean(actionToken));
   const [serviceStatus, setServiceStatus] = useState("checking");
 
   useEffect(() => {
@@ -40,7 +40,6 @@ export default function AuthDialog({ apiBaseUrl = "/api", initialName = "", init
   useEffect(() => {
     if (initialAction !== "verify" || !actionToken) return;
     let active = true;
-    setBusy(true);
     fetch(`${apiBaseUrl}/auth/${API_PATHS.verify}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -95,6 +94,7 @@ export default function AuthDialog({ apiBaseUrl = "/api", initialName = "", init
       }
       if (mode === "reset") {
         setMode("login");
+        if (result.email) setEmail(result.email);
         setPassword("");
         setConfirmPassword("");
         setNotice(result.message || "Password updated. Sign in with your new password.");

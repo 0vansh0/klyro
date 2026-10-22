@@ -89,6 +89,7 @@ const EMAIL_FROM = process.env.EMAIL_FROM || "";
 let authTokensCollection = null;
 let rateLimitsCollection = null;
 let emailFetch = globalThis.fetch;
+let publicInitialization = null;
 
 function publicDeploymentProblems() {
   if (!publicDeployment) return [];
@@ -99,11 +100,12 @@ function publicDeploymentProblems() {
   let appOrigin = "";
   try {
     const appUrl = new URL(PUBLIC_APP_URL);
-    if (appUrl.protocol !== "https:" || appUrl.username || appUrl.password || appUrl.search || appUrl.hash) throw new Error("invalid");
+    if (appUrl.protocol !== "https:" || appUrl.username || appUrl.password || appUrl.search || appUrl.hash || appUrl.pathname !== "/") throw new Error("invalid");
     appOrigin = appUrl.origin;
   } catch { problems.push("PUBLIC_APP_URL must be a valid HTTPS URL without credentials, query, or fragment"); }
   if (!appOrigin || allowedOrigins.length !== 1 || allowedOrigins[0] !== appOrigin) problems.push("CLIENT_ORIGINS must contain only the exact PUBLIC_APP_URL origin");
   if (!process.env.TRUST_PROXY || process.env.TRUST_PROXY === "true") problems.push("TRUST_PROXY must match the actual trusted ingress proxy hop count or CIDR");
+  if (/^\d+$/.test(process.env.TRUST_PROXY || "") && (Number(process.env.TRUST_PROXY) < 1 || Number(process.env.TRUST_PROXY) > 3)) problems.push("Numeric TRUST_PROXY must be between 1 and 3 hops; otherwise configure explicit trusted proxy subnets");
   if (process.env.TRUST_PROXY && !/^\d+$/.test(process.env.TRUST_PROXY) && !/^(loopback|linklocal|uniquelocal)(,(loopback|linklocal|uniquelocal))*$/.test(process.env.TRUST_PROXY)) problems.push("TRUST_PROXY must be a hop count or explicit trusted proxy subnet list");
   if (EMAIL_PROVIDER !== "resend" || !RESEND_API_KEY || !EMAIL_FROM) problems.push("EMAIL_PROVIDER=resend, RESEND_API_KEY, and EMAIL_FROM are required for verification and recovery mail");
   const backupRetention = positiveInteger(process.env.MONGODB_BACKUP_RETENTION_DAYS, 0);
@@ -475,7 +477,7 @@ function publicUser(user) {
   return { id: String(user._id), name: user.name, email: user.email };
 }
 
-async function createSession(userId, res, session = null) {
+async function createSession(userId, res, session = null, { setCookie = true } = {}) {
   const token = randomBytes(32).toString("base64url");
   await sessionsCollection.insertOne({
     tokenHash: tokenDigest(token),
@@ -483,7 +485,8 @@ async function createSession(userId, res, session = null) {
     createdAt: new Date(),
     expiresAt: new Date(Date.now() + AUTH_SESSION_TTL_MS),
   }, session ? { session } : {});
-  setSessionCookie(res, token);
+  if (setCookie) setSessionCookie(res, token);
+  return token;
 }
 
 async function withPublicTransaction(operation) {
@@ -510,7 +513,7 @@ async function sendAccountActionEmail(email, token, type) {
   if (EMAIL_PROVIDER !== "resend" || !RESEND_API_KEY || !EMAIL_FROM) throw new Error("Account email delivery is not configured.");
   const link = new URL("/", PUBLIC_APP_URL);
   const parameter = type === "email_verification" ? "verifyEmail" : "resetPassword";
-  link.searchParams.set(parameter, token);
+  link.hash = `${parameter}=${encodeURIComponent(token)}`;
   const action = type === "email_verification" ? "Verify your email address" : "Reset your KLYRO password";
   const response = await emailFetch("https://api.resend.com/emails", {
     method: "POST",
@@ -652,12 +655,13 @@ app.post("/api/auth/verify-email", async (req, res) => {
     if (!tokenRecord) return res.status(400).json({ error: "This verification link is invalid or expired. Request a new one and try again." });
     const user = await usersCollection.findOne({ _id: tokenRecord.userId });
     if (!user) return res.status(400).json({ error: "This verification link is invalid or expired. Request a new one and try again." });
-    await withPublicTransaction(async (session) => {
+    const sessionToken = await withPublicTransaction(async (session) => {
       const options = session ? { session } : {};
       await usersCollection.updateOne({ _id: user._id }, { $set: { emailVerified: true, emailVerifiedAt: new Date() } }, options);
       await authTokensCollection.deleteMany({ userId: user._id, type: "email_verification" }, options);
-      await createSession(user._id, res, session);
+      return createSession(user._id, res, session, { setCookie: false });
     });
+    setSessionCookie(res, sessionToken);
     return res.json({ authenticated: true, user: publicUser({ ...user, emailVerified: true }) });
   } catch (error) {
     console.error("Could not verify account email:", error.message);
@@ -701,7 +705,8 @@ app.post("/api/auth/password/reset", async (req, res) => {
       return true;
     });
     if (!changed) return res.status(400).json({ error: "This password reset link is invalid or expired." });
-    return res.json({ success: true, message: "Password updated. Sign in with your new password." });
+    const user = await usersCollection.findOne({ _id: tokenRecord.userId }, { projection: { email: 1 } });
+    return res.json({ success: true, email: user?.email || "", message: "Password updated. Sign in with your new password." });
   } catch (error) {
     console.error("Could not reset account password:", error.message);
     return res.status(503).json({ error: "Could not reset your password right now. Please try again." });
@@ -1300,7 +1305,23 @@ async function startServer() {
   });
 }
 
-export { app, connectMongo, resetRateLimitsForTests, setAuthCollectionsForTests, setDockerForTests, setMongoForTests, setPublicDeploymentForTests, setRepairProviderForTests, setReviewsCollectionForTests, readiness };
+async function preparePublicDeployment() {
+  if (!publicDeployment) throw new Error("PUBLIC_DEPLOYMENT=true is required for a public serverless deployment.");
+  if (!publicInitialization) {
+    publicInitialization = (async () => {
+      const problems = publicDeploymentProblems();
+      if (problems.length) throw new Error(`Public deployment configuration is incomplete: ${problems.join("; ")}`);
+      const connected = await connectMongo();
+      if (!connected || !readiness()) throw new Error("Public deployment requires a connected MongoDB replica set, auth token storage, and shared rate-limit storage.");
+    })().catch((error) => {
+      publicInitialization = null;
+      throw error;
+    });
+  }
+  return publicInitialization;
+}
+
+export { app, connectMongo, preparePublicDeployment, resetRateLimitsForTests, setAuthCollectionsForTests, setDockerForTests, setMongoForTests, setPublicDeploymentForTests, setRepairProviderForTests, setReviewsCollectionForTests, readiness };
 
 function setReviewsCollectionForTests(collection) {
   reviewsCollection = collection;
