@@ -15,7 +15,7 @@ KLYRO is a local code review workspace with a React/Vite interface and an Expres
 3. Start both the API and Vite using `npm run dev`.
 4. Open the local Vite URL printed by the command (normally `http://localhost:5173`).
 
-The API binds to `127.0.0.1:5000` by default. The Vite proxy forwards same-origin `/api` requests to that local API, including account cookies. The frontend intentionally uses this same-origin path; a separate frontend/API origin is unsupported until credentialed CORS and CSRF protections are implemented. API environment variables can be placed in the root `.env` or `server/.env`; root `.env` values are loaded first.
+The API binds to `127.0.0.1:5000` by default. The Vite proxy forwards same-origin `/api` requests to that local API, including account cookies. The frontend intentionally uses this same-origin path; public mode also requires one HTTPS app origin and same-origin API requests. API environment variables can be placed in the root `.env` or `server/.env`; root `.env` values are loaded first.
 
 ## Analyzer coverage
 
@@ -50,6 +50,10 @@ The API is rooted at `/api`.
 | `PATCH /auth/profile` | Update the signed-in account display name with `name` |
 | `POST /auth/register` | Create an account with `name`, `email`, and `password` |
 | `POST /auth/login` | Sign in with `email` and `password` |
+| `POST /auth/verify-email` | Consume a one-time email verification token |
+| `POST /auth/verification/resend` | Request a verification link without revealing account existence |
+| `POST /auth/password/forgot` | Request a password recovery email without revealing account existence |
+| `POST /auth/password/reset` | Consume a one-time password reset token and revoke sessions |
 | `POST /auth/logout` | Revoke the current session |
 | `DELETE /auth/account` | Delete the signed-in account and its reviews after confirming `password` |
 | `POST /analyze` | Analyze submitted code; body fields: `code`, `language`, optional `mode`, `fileId`, `fileName`, and `autoFix` |
@@ -59,23 +63,42 @@ The API is rooted at `/api`.
 | `GET /reviews` | Get the most recent 100 reviews for the signed-in account |
 | `DELETE /reviews/:id` | Delete one of the signed-in account's reviews by UUID |
 
-`mode` accepts `eslint`, `syntax`, or the legacy alias `static`. `language` accepts a profile in the Analyzer coverage table. `fileId` is limited to 128 identifier characters. `fileName` must be a printable basename up to 255 characters. Code is limited to 50,000 characters and JSON request bodies to 100 KB. Invalid bodies and fields return JSON errors with a `4xx` status. Requests are rate limited per client IP over a 60-second window; defaults are 120 API requests, 30 analysis requests, 30 repairs, 10 runs, 10 login attempts, and 5 account registrations.
+`mode` accepts `eslint`, `syntax`, or the legacy alias `static`. `language` accepts a profile in the Analyzer coverage table. `fileId` is limited to 128 identifier characters. `fileName` must be a printable basename up to 255 characters. Code is limited to 50,000 characters and JSON request bodies to 100 KB. Invalid bodies and fields return JSON errors with a `4xx` status. Requests are rate limited over 60-second windows; local mode stores counters in process memory, while public mode uses MongoDB shared counters and refuses requests if that store is unavailable. Defaults are 120 API requests, 30 analysis requests, 30 repairs, 10 runs, 10 login attempts, 5 registrations, and 3 each for email verification and password recovery actions.
 
 ## MongoDB and review data
 
-When `MONGODB_URI` is omitted, guest analysis still works but review history is not stored in the browser; account registration and sign-in respond with `503`. When MongoDB is configured, the API attempts to connect during startup and retries every 30 seconds after a failure. During an outage, analysis continues, new reviews are not persisted, `/health/live` remains `200`, and `/health/ready` returns `503`. Once MongoDB reconnects, persistence resumes. Passwords are hashed with Node's scrypt; session tokens are random, stored as hashes, and sent in HttpOnly SameSite cookies that expire after 30 days. Login attempts are rate limited. Review documents contain submitted source code, so treat the local MongoDB database and its backups as sensitive data. MongoDB automatically expires review documents after 30 days by default (`REVIEW_RETENTION_DAYS`); startup upgrades the existing date index with `collMod`, or rebuilds only that index on MongoDB versions that cannot alter its TTL option. TTL cleanup runs asynchronously, and backups may retain old copies. Signed-in users can update their display name on **My Profile**, and delete their account from that page or with `DELETE /auth/account`; deletion removes their reviews, sessions, and account. Password reset emails are not configured in this prototype.
+When `MONGODB_URI` is omitted, guest analysis still works but account registration and sign-in respond with `503`. Local mode connects at startup and retries every 30 seconds after failures. In public mode, MongoDB is mandatory and the service refuses to start unless it can connect to a replica set. Passwords use Node scrypt; random session tokens are stored as hashes in HttpOnly, SameSite cookies (7-day lifetime in public mode). Public accounts must verify email before signing in. Verification and password reset links are one-time MongoDB tokens with 24-hour and 30-minute expiry; password reset revokes all sessions. Review documents contain submitted source code. MongoDB review TTL cleanup runs asynchronously; backups can retain deleted or expired records until their configured expiration. Account deletion transactionally removes the live account, reviews, sessions, and account tokens. Operators must define and disclose backup retention and deletion timelines and regularly prove restore and expiry behavior.
 
 ## Single-user and deployment boundary
 
-This remains a **local-only prototype**. Account sessions and persisted review history are scoped per user, and the server rejects non-loopback `HOST` values. Do not expose it through a public ingress, reverse proxy, or shared network. Public deployment is not enabled: it requires a broader security review, password recovery, email verification, stronger CSRF/origin protections, a shared rate-limit store across instances, and operational review of backups and deletion guarantees. Rate limits are currently in memory and reset on restart.
+Public exposure is **disabled by default**. With `PUBLIC_DEPLOYMENT` unset or `false`, the API only binds to loopback and rate limits are process-local. Public mode requires `PUBLIC_DEPLOYMENT=true`, `NODE_ENV=production`, an HTTPS `PUBLIC_APP_URL`, exact matching `CLIENT_ORIGINS`, a correctly scoped `TRUST_PROXY`, MongoDB replica-set storage, a configured Resend sender, and backup-retention/restore-test attestations. Startup fails closed if a requirement is missing or MongoDB/shared rate-limit storage is unavailable. The server uses secure cookies, HTTPS enforcement, exact origin/referer checks and Fetch Metadata rejection for state-changing requests, security headers, shared MongoDB rate limits, email verification, password recovery, and transactional account deletion. Do not expose the application until the infrastructure and operational checklist below is complete.
+
+### Public deployment operator checklist
+
+1. Complete a deployment-specific security review, including dependency audit, threat model, auth/session review, CORS/origin checks, and external security testing. The application code has been reviewed for the public-mode boundary; this is not a penetration test or a substitute for your hosting provider’s review.
+2. Use HTTPS at the trusted ingress, bind the API to the private service network (commonly `0.0.0.0` inside a container), and set `TRUST_PROXY` only to the actual proxy hop count or trusted proxy subnet. Keep frontend and API on the same origin; do not expose the API directly.
+3. Configure MongoDB with access controls, encryption, replica set, automated backups, a documented retention period, and a tested restore process. Set `MONGODB_BACKUP_RETENTION_DAYS` and `MONGODB_BACKUP_RESTORE_TESTED_AT` only after these are real and verified. These values are operator attestations; the application cannot create or verify provider backups. Ensure account deletion is disclosed as removing live data immediately while retained backups expire on the stated schedule.
+4. Configure Resend with a verified sender domain and deliverability monitoring. Set the server-only email credentials. Verify signup, resend, recovery, expiry, single-use token behavior, and delivery failure handling in a staging deployment.
+5. Keep all secrets in the hosting secret manager, restrict database and mail-provider credentials, enable log/alert monitoring, and verify health/readiness behavior during database and mail-provider outages. Never commit production `.env` files.
+6. Only then enable `PUBLIC_DEPLOYMENT=true`. The startup gate requires a fresh restore-test date (within 90 days) and a declared backup retention of 1–90 days. `/api/health/ready` reports non-secret configuration blockers.
+
+Database-backed rate limits are shared across API instances and fail closed if unavailable. They use a hashed client identity and are automatically expired. Email recovery endpoints return generic responses to reduce account enumeration. The currently supported email provider is Resend.
 
 ## Environment variables
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HOST` | `127.0.0.1` | API bind host; loopback hosts only |
+| `HOST` | `127.0.0.1` | Loopback only by default; public mode requires an externally reachable bind such as `0.0.0.0` behind a trusted ingress |
+| `PUBLIC_DEPLOYMENT` | `false` | Explicit opt-in to the guarded public deployment mode |
 | `PORT` | `5000` | API port |
 | `CLIENT_ORIGINS` | local Vite origins | Comma-separated browser origins allowed by CORS |
+| `PUBLIC_APP_URL` | unset | Public HTTPS app origin; must exactly match the sole `CLIENT_ORIGINS` entry |
+| `TRUST_PROXY` | unset | Trusted ingress hop count or explicit proxy subnet/trust labels; must match hosting topology |
+| `EMAIL_PROVIDER` | unset | Must be `resend` in public mode |
+| `RESEND_API_KEY` | unset | Server-only email API credential |
+| `EMAIL_FROM` | unset | Verified sender address/name used for account email |
+| `MONGODB_BACKUP_RETENTION_DAYS` | unset | Operator-attested backup retention period required for public mode |
+| `MONGODB_BACKUP_RESTORE_TESTED_AT` | unset | ISO date/time of a successful restore test within the last 90 days |
 | `API_RATE_LIMIT` | `120` | Requests per IP per 60 seconds across API routes |
 | `ANALYZE_RATE_LIMIT` | `30` | Analysis requests per IP per 60 seconds |
 | `REPAIR_RATE_LIMIT` | `30` | AI repair requests per IP per 60 seconds |

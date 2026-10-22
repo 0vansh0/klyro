@@ -155,6 +155,8 @@ export default function App() {
   const [profile, setProfile] = useState({ name: "Guest", role: "Student" });
   const [authUser, setAuthUser] = useState(null);
   const [authDialogOpen, setAuthDialogOpen] = useState(false);
+  const [authAction, setAuthAction] = useState("");
+  const [authActionToken, setAuthActionToken] = useState("");
 
   const [toast, setToast] = useState("");
   const [sidebarHidden, setSidebarHidden] = useState(false);
@@ -174,6 +176,21 @@ export default function App() {
 
   useEffect(() => {
     try { window.localStorage.removeItem(STORAGE_KEYS.history); } catch { /* Code history is account-only; cleanup is best effort. */ }
+  }, []);
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    const verifyToken = url.searchParams.get("verifyEmail");
+    const resetToken = url.searchParams.get("resetPassword");
+    if (!verifyToken && !resetToken) return;
+    const token = verifyToken || resetToken;
+    const action = verifyToken ? "verify" : "reset";
+    url.searchParams.delete("verifyEmail");
+    url.searchParams.delete("resetPassword");
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    setAuthAction(action);
+    setAuthActionToken(token);
+    setAuthDialogOpen(true);
   }, []);
   useEffect(() => writeStoredValue(STORAGE_KEYS.appearance, appearance), [appearance]);
   useEffect(() => writeStoredValue(STORAGE_KEYS.language, language), [language]);
@@ -1105,7 +1122,7 @@ export default function App() {
           </div>
         )}
 
-        {authDialogOpen && <AuthDialog apiBaseUrl={API_BASE_URL} initialName={profile.name} onClose={() => setAuthDialogOpen(false)} onSuccess={finishSignIn} />}
+        {authDialogOpen && <AuthDialog apiBaseUrl={API_BASE_URL} initialName={profile.name} initialAction={authAction} actionToken={authActionToken} onClose={() => { setAuthDialogOpen(false); setAuthAction(""); setAuthActionToken(""); }} onSuccess={finishSignIn} />}
 
         {toast && (
           <div className="toast-message" role="status">

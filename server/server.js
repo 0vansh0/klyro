@@ -22,6 +22,7 @@ dotenv.config({ path: path.resolve(serverDirectory, "..", ".env") });
 dotenv.config({ path: path.resolve(serverDirectory, ".env") });
 
 const app = express();
+app.disable("x-powered-by");
 const PORT = process.env.PORT || 5000;
 const HOST = process.env.HOST || "127.0.0.1";
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -76,33 +77,99 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 let dockerSpawn = spawn;
 let runTimeoutMs = positiveInteger(process.env.RUN_TIMEOUT_MS, 10000);
 const scrypt = promisify(scryptCallback);
-const AUTH_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const AUTH_SESSION_TTL_MS = process.env.PUBLIC_DEPLOYMENT === "true" ? 7 * 24 * 60 * 60 * 1000 : 30 * 24 * 60 * 60 * 1000;
 const AUTH_COOKIE_NAME = "codesentinel_session";
+const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 30 * 60 * 1000;
+let publicDeployment = process.env.PUBLIC_DEPLOYMENT === "true";
+const PUBLIC_APP_URL = process.env.PUBLIC_APP_URL || "";
+const EMAIL_PROVIDER = process.env.EMAIL_PROVIDER || "";
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const EMAIL_FROM = process.env.EMAIL_FROM || "";
+let authTokensCollection = null;
+let rateLimitsCollection = null;
+let emailFetch = globalThis.fetch;
+
+function publicDeploymentProblems() {
+  if (!publicDeployment) return [];
+  const problems = [];
+  if (process.env.NODE_ENV !== "production") problems.push("NODE_ENV must be production");
+  if (!MONGODB_URI || MONGODB_URI.includes("<")) problems.push("MONGODB_URI must point to the production MongoDB database");
+  if (!PUBLIC_APP_URL) problems.push("PUBLIC_APP_URL must be the HTTPS app origin");
+  let appOrigin = "";
+  try {
+    const appUrl = new URL(PUBLIC_APP_URL);
+    if (appUrl.protocol !== "https:" || appUrl.username || appUrl.password || appUrl.search || appUrl.hash) throw new Error("invalid");
+    appOrigin = appUrl.origin;
+  } catch { problems.push("PUBLIC_APP_URL must be a valid HTTPS URL without credentials, query, or fragment"); }
+  if (!appOrigin || allowedOrigins.length !== 1 || allowedOrigins[0] !== appOrigin) problems.push("CLIENT_ORIGINS must contain only the exact PUBLIC_APP_URL origin");
+  if (!process.env.TRUST_PROXY || process.env.TRUST_PROXY === "true") problems.push("TRUST_PROXY must match the actual trusted ingress proxy hop count or CIDR");
+  if (process.env.TRUST_PROXY && !/^\d+$/.test(process.env.TRUST_PROXY) && !/^(loopback|linklocal|uniquelocal)(,(loopback|linklocal|uniquelocal))*$/.test(process.env.TRUST_PROXY)) problems.push("TRUST_PROXY must be a hop count or explicit trusted proxy subnet list");
+  if (EMAIL_PROVIDER !== "resend" || !RESEND_API_KEY || !EMAIL_FROM) problems.push("EMAIL_PROVIDER=resend, RESEND_API_KEY, and EMAIL_FROM are required for verification and recovery mail");
+  const backupRetention = positiveInteger(process.env.MONGODB_BACKUP_RETENTION_DAYS, 0);
+  if (backupRetention < 1 || backupRetention > 90) problems.push("MONGODB_BACKUP_RETENTION_DAYS must document a backup retention period from 1 to 90 days");
+  const restoreTestedAt = Date.parse(process.env.MONGODB_BACKUP_RESTORE_TESTED_AT || "");
+  if (!Number.isFinite(restoreTestedAt) || restoreTestedAt > Date.now() || Date.now() - restoreTestedAt > 90 * 24 * 60 * 60 * 1000) problems.push("MONGODB_BACKUP_RESTORE_TESTED_AT must record a restore test from the last 90 days");
+  return problems;
+}
 
 function rateLimit(limitForRequest, bucketName = "api") {
-  return (req, res, next) => {
+  return async (req, res, next) => {
+    if (publicDeployment && req.path.startsWith("/health")) return next();
     const now = Date.now();
     const route = req.originalUrl.split("?", 1)[0] === "/api/analyze" ? "analyze" : "api";
-    const key = `${bucketName}:${route}:${req.ip}`;
-    const limit = limitForRequest(route);
-    let bucket = rateLimitBuckets.get(key);
-    if (!bucket || now >= bucket.resetAt) {
-      bucket = { count: 0, resetAt: now + API_RATE_WINDOW_MS };
-      rateLimitBuckets.set(key, bucket);
+    const emailIdentity = bucketName === "auth-login" && typeof req.body?.email === "string"
+      ? createHash("sha256").update(req.body.email.trim().toLowerCase()).digest("hex")
+      : "";
+    const clientIdentity = `${req.ip || req.socket.remoteAddress || "unknown"}:${emailIdentity}`;
+    const key = `${bucketName}:${route}:${createHash("sha256").update(clientIdentity).digest("hex")}`;
+    const limit = limitForRequest(route, req);
+    let count;
+    let resetAt;
+    if (publicDeployment) {
+      if (!rateLimitsCollection) return res.status(503).json({ error: "Shared rate-limit storage is unavailable. Please retry shortly." });
+      try {
+        const nowDate = new Date(now);
+        const nextWindow = new Date(now + API_RATE_WINDOW_MS);
+        const expiresAt = new Date(now + API_RATE_WINDOW_MS * 2);
+        const activeWindow = { $gt: [{ $ifNull: ["$resetAt", new Date(0)] }, nowDate] };
+        const record = await rateLimitsCollection.findOneAndUpdate(
+          { _id: key },
+          [{ $set: {
+            count: { $cond: [activeWindow, { $add: [{ $ifNull: ["$count", 0] }, 1] }, 1] },
+            resetAt: { $cond: [activeWindow, "$resetAt", nextWindow] },
+            expiresAt: { $cond: [activeWindow, "$expiresAt", expiresAt] },
+          } }],
+          { upsert: true, returnDocument: "after" },
+        );
+        count = record?.count;
+        resetAt = new Date(record?.resetAt || nextWindow).getTime();
+      } catch (error) {
+        console.error("Shared rate-limit storage failed:", error.message);
+        return res.status(503).json({ error: "Shared rate-limit storage is unavailable. Please retry shortly." });
+      }
+    } else {
+      let bucket = rateLimitBuckets.get(key);
+      if (!bucket || now >= bucket.resetAt) {
+        bucket = { count: 0, resetAt: now + API_RATE_WINDOW_MS };
+        rateLimitBuckets.set(key, bucket);
+      }
+      bucket.count += 1;
+      count = bucket.count;
+      resetAt = bucket.resetAt;
     }
-    bucket.count += 1;
     res.set("RateLimit-Limit", String(limit));
-    res.set("RateLimit-Remaining", String(Math.max(0, limit - bucket.count)));
-    res.set("RateLimit-Reset", String(Math.ceil(bucket.resetAt / 1000)));
-    if (bucket.count > limit) {
-      const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+    res.set("RateLimit-Remaining", String(Math.max(0, limit - count)));
+    res.set("RateLimit-Reset", String(Math.ceil(resetAt / 1000)));
+    if (count > limit) {
+      const retryAfter = Math.max(1, Math.ceil((resetAt - now) / 1000));
       res.set("Retry-After", String(retryAfter));
       const error = bucketName === "repair"
         ? `Repair limit reached (${limit} requests per minute). Try again in ${retryAfter} seconds.`
         : `Too many requests. Try again in ${retryAfter} seconds.`;
       return res.status(429).json({ error });
     }
-    if (rateLimitBuckets.size > 10_000) {
+    if (!publicDeployment && rateLimitBuckets.size > 10_000) {
       for (const [bucketKey, value] of rateLimitBuckets) {
         if (now >= value.resetAt) rateLimitBuckets.delete(bucketKey);
       }
@@ -110,10 +177,6 @@ function rateLimit(limitForRequest, bucketName = "api") {
     return next();
   };
 }
-
-app.use("/api", rateLimit((route) => route === "analyze" ? ANALYZE_RATE_LIMIT : API_RATE_LIMIT));
-app.use("/api/auth/login", rateLimit(() => 10, "auth-login"));
-app.use("/api/auth/register", rateLimit(() => 5, "auth-register"));
 
 function isLocalDevelopmentOrigin(origin) {
   return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin);
@@ -130,8 +193,12 @@ app.use(cors({
       callback(null, true);
       return;
     }
-    callback(new Error(`Origin ${origin} is not allowed by CORS.`));
+    callback(new Error("Origin is not allowed by CORS."));
   },
+  credentials: true,
+  methods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type"],
+  maxAge: 600,
 }));
 
 app.use((error, _req, res, next) => {
@@ -141,7 +208,43 @@ app.use((error, _req, res, next) => {
   return next(error);
 });
 
+app.use((req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+  });
+  if (publicDeployment) res.set("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
+  next();
+});
+
+const trustProxyValue = process.env.TRUST_PROXY || "";
+if (trustProxyValue) app.set("trust proxy", /^\d+$/.test(trustProxyValue) ? Number(trustProxyValue) : trustProxyValue);
+
 app.use(express.json({ limit: "100kb" }));
+app.use("/api", rateLimit((route) => route === "analyze" ? ANALYZE_RATE_LIMIT : API_RATE_LIMIT));
+app.use("/api/auth/login", rateLimit(() => 10, "auth-login"));
+app.use("/api/auth/register", rateLimit(() => 5, "auth-register"));
+app.use("/api/auth/verification", rateLimit(() => 3, "auth-verification"));
+app.use("/api/auth/password", rateLimit(() => 3, "auth-password"));
+app.use("/api", (req, res, next) => {
+  if (!publicDeployment || ["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  if (!req.secure) return res.status(400).json({ error: "HTTPS is required for account and data changes." });
+  const origin = req.get("origin");
+  let sourceOrigin = origin;
+  if (!sourceOrigin) {
+    try { sourceOrigin = req.get("referer") ? new URL(req.get("referer")).origin : ""; } catch { sourceOrigin = ""; }
+  }
+  if (!sourceOrigin || sourceOrigin === "null" || !allowedOrigins.includes(sourceOrigin)) {
+    return res.status(403).json({ error: "Request origin could not be verified." });
+  }
+  if (req.get("sec-fetch-site") === "cross-site") return res.status(403).json({ error: "Cross-site state changes are not allowed." });
+  return next();
+});
 
 async function connectMongo() {
   if (mongoUri?.includes("<db_password>")) {
@@ -161,14 +264,22 @@ async function connectMongo() {
       serverSelectionTimeoutMS: 6000,
     });
     await mongoClient.connect();
+    if (publicDeployment && !String(mongoClient.topology?.description?.type || "").startsWith("ReplicaSet")) {
+      throw new Error("Public mode requires a MongoDB replica set for atomic account deletion.");
+    }
     reviewsCollection = mongoClient.db(MONGODB_DB).collection("reviews");
     usersCollection = mongoClient.db(MONGODB_DB).collection("users");
     sessionsCollection = mongoClient.db(MONGODB_DB).collection("sessions");
+    authTokensCollection = mongoClient.db(MONGODB_DB).collection("authTokens");
+    rateLimitsCollection = mongoClient.db(MONGODB_DB).collection("rateLimits");
     await ensureReviewRetentionIndex(reviewsCollection);
     await reviewsCollection.createIndex({ userId: 1, date: -1 });
     await usersCollection.createIndex({ email: 1 }, { unique: true });
     await sessionsCollection.createIndex({ tokenHash: 1 }, { unique: true });
     await sessionsCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await authTokensCollection.createIndex({ tokenHash: 1 }, { unique: true });
+    await authTokensCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await rateLimitsCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
     mongoStatus = "connected";
     console.log(`MongoDB connected (${MONGODB_DB}.reviews).`);
     return true;
@@ -180,6 +291,8 @@ async function connectMongo() {
     reviewsCollection = null;
     usersCollection = null;
     sessionsCollection = null;
+    authTokensCollection = null;
+    rateLimitsCollection = null;
     return false;
   }
 }
@@ -316,7 +429,8 @@ function createAnalyzer(strictness, customRules, fix) {
 }
 
 function readiness() {
-  return !mongoUri || mongoStatus === "connected";
+  if (!publicDeployment) return !mongoUri || mongoStatus === "connected";
+  return publicDeploymentProblems().length === 0 && mongoStatus === "connected" && Boolean(usersCollection && sessionsCollection && authTokensCollection && rateLimitsCollection);
 }
 
 function tokenFromRequest(req) {
@@ -361,19 +475,62 @@ function publicUser(user) {
   return { id: String(user._id), name: user.name, email: user.email };
 }
 
-async function createSession(userId, res) {
+async function createSession(userId, res, session = null) {
   const token = randomBytes(32).toString("base64url");
   await sessionsCollection.insertOne({
     tokenHash: tokenDigest(token),
     userId,
     createdAt: new Date(),
     expiresAt: new Date(Date.now() + AUTH_SESSION_TTL_MS),
-  });
+  }, session ? { session } : {});
   setSessionCookie(res, token);
 }
 
+async function withPublicTransaction(operation) {
+  if (!publicDeployment) return operation(null);
+  const session = mongoClient.startSession();
+  try { return await session.withTransaction(() => operation(session)); }
+  finally { await session.endSession(); }
+}
+
+async function createAccountToken(userId, type, ttlMs) {
+  if (!authTokensCollection) throw new Error("Account token storage is unavailable.");
+  const token = randomBytes(32).toString("base64url");
+  await authTokensCollection.insertOne({
+    tokenHash: tokenDigest(token),
+    userId,
+    type,
+    createdAt: new Date(),
+    expiresAt: new Date(Date.now() + ttlMs),
+  });
+  return token;
+}
+
+async function sendAccountActionEmail(email, token, type) {
+  if (EMAIL_PROVIDER !== "resend" || !RESEND_API_KEY || !EMAIL_FROM) throw new Error("Account email delivery is not configured.");
+  const link = new URL("/", PUBLIC_APP_URL);
+  const parameter = type === "email_verification" ? "verifyEmail" : "resetPassword";
+  link.searchParams.set(parameter, token);
+  const action = type === "email_verification" ? "Verify your email address" : "Reset your KLYRO password";
+  const response = await emailFetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      from: EMAIL_FROM,
+      to: [email],
+      subject: action,
+      text: `${action}: ${link.toString()}\n\nIf you did not request this, you can ignore this email.`,
+      html: `<p>${action} by opening this link:</p><p><a href="${link.toString()}">${link.toString()}</a></p><p>If you did not request this, you can ignore this email.</p>`,
+    }),
+  });
+  if (!response.ok) {
+    console.error("Account email provider rejected a message (HTTP %s).", response.status);
+    throw new Error("Could not send the account email.");
+  }
+}
+
 function authServiceAvailable(res) {
-  if (usersCollection && sessionsCollection) return true;
+  if (usersCollection && sessionsCollection && (!publicDeployment || authTokensCollection)) return true;
   if (mongoUri?.includes("<db_password>")) {
     res.status(503).json({ error: "MongoDB is not connected because MONGODB_URI still contains <db_password>. Replace that placeholder with your database password in the project-root .env, then fully stop and restart npm run dev." });
     return false;
@@ -429,8 +586,13 @@ app.post("/api/auth/register", async (req, res) => {
   try {
     const salt = randomBytes(16).toString("hex");
     const passwordHash = (await scrypt(password, salt, 64)).toString("hex");
-    const user = { _id: randomUUID(), name: displayName, email: normalizedEmail, passwordSalt: salt, passwordHash, createdAt: new Date() };
+    const user = { _id: randomUUID(), name: displayName, email: normalizedEmail, passwordSalt: salt, passwordHash, emailVerified: !publicDeployment, createdAt: new Date() };
     await usersCollection.insertOne(user);
+    if (publicDeployment) {
+      const token = await createAccountToken(user._id, "email_verification", EMAIL_VERIFICATION_TTL_MS);
+      await sendAccountActionEmail(user.email, token, "email_verification");
+      return res.status(201).json({ verificationRequired: true, message: "Check your email for a verification link before signing in." });
+    }
     await createSession(user._id, res);
     return res.status(201).json({ authenticated: true, user: publicUser(user) });
   } catch (error) {
@@ -455,11 +617,94 @@ app.post("/api/auth/login", async (req, res) => {
     const expected = user ? Buffer.from(user.passwordHash, "hex") : randomBytes(64);
     const valid = expected.length === candidate.length && timingSafeEqual(expected, candidate);
     if (!user || !valid) return res.status(401).json({ error: "Email or password is incorrect." });
+    if (publicDeployment && user.emailVerified !== true) return res.status(403).json({ error: "Verify your email before signing in. You can request another verification link below." });
     await createSession(user._id, res);
     return res.json({ authenticated: true, user: publicUser(user) });
   } catch (error) {
     console.error("Could not sign in:", error.message);
     return res.status(500).json({ error: "Could not sign in. Please try again." });
+  }
+});
+
+app.post("/api/auth/verification/resend", async (req, res) => {
+  if (!authServiceAvailable(res)) return;
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
+  try {
+    const user = await usersCollection.findOne({ email });
+    if (user && user.emailVerified !== true) {
+      const token = await createAccountToken(user._id, "email_verification", EMAIL_VERIFICATION_TTL_MS);
+      await sendAccountActionEmail(email, token, "email_verification");
+    }
+    return res.json({ message: "If this account needs verification, a new link has been sent." });
+  } catch (error) {
+    console.error("Could not resend account verification:", error.message);
+    return res.json({ message: "If this account needs verification, a new link has been sent." });
+  }
+});
+
+app.post("/api/auth/verify-email", async (req, res) => {
+  if (!authServiceAvailable(res)) return;
+  const token = typeof req.body?.token === "string" ? req.body.token : "";
+  if (!token || token.length > 128) return res.status(400).json({ error: "This verification link is invalid or expired." });
+  try {
+    const tokenRecord = await authTokensCollection.findOne({ tokenHash: tokenDigest(token), type: "email_verification", expiresAt: { $gt: new Date() } });
+    if (!tokenRecord) return res.status(400).json({ error: "This verification link is invalid or expired. Request a new one and try again." });
+    const user = await usersCollection.findOne({ _id: tokenRecord.userId });
+    if (!user) return res.status(400).json({ error: "This verification link is invalid or expired. Request a new one and try again." });
+    await withPublicTransaction(async (session) => {
+      const options = session ? { session } : {};
+      await usersCollection.updateOne({ _id: user._id }, { $set: { emailVerified: true, emailVerifiedAt: new Date() } }, options);
+      await authTokensCollection.deleteMany({ userId: user._id, type: "email_verification" }, options);
+      await createSession(user._id, res, session);
+    });
+    return res.json({ authenticated: true, user: publicUser({ ...user, emailVerified: true }) });
+  } catch (error) {
+    console.error("Could not verify account email:", error.message);
+    return res.status(503).json({ error: "Could not verify this account right now. Please request a new link and retry." });
+  }
+});
+
+app.post("/api/auth/password/forgot", async (req, res) => {
+  if (!authServiceAvailable(res)) return;
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: "Enter a valid email address." });
+  try {
+    const user = await usersCollection.findOne({ email });
+    if (user) {
+      const token = await createAccountToken(user._id, "password_reset", PASSWORD_RESET_TTL_MS);
+      await sendAccountActionEmail(email, token, "password_reset");
+    }
+  } catch (error) {
+    console.error("Password recovery email request could not be completed:", error.message);
+  }
+  return res.json({ message: "If an account exists for this address, a password reset link has been sent." });
+});
+
+app.post("/api/auth/password/reset", async (req, res) => {
+  if (!authServiceAvailable(res)) return;
+  const token = typeof req.body?.token === "string" ? req.body.token : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!token || token.length > 128) return res.status(400).json({ error: "This password reset link is invalid or expired." });
+  if (password.length < 8 || password.length > 128) return res.status(400).json({ error: "Password must be between 8 and 128 characters." });
+  try {
+    const tokenRecord = await authTokensCollection.findOne({ tokenHash: tokenDigest(token), type: "password_reset", expiresAt: { $gt: new Date() } });
+    if (!tokenRecord) return res.status(400).json({ error: "This password reset link is invalid or expired. Request a new one and try again." });
+    const salt = randomBytes(16).toString("hex");
+    const passwordHash = (await scrypt(password, salt, 64)).toString("hex");
+    const changed = await withPublicTransaction(async (session) => {
+      const options = session ? { session } : {};
+      const result = await usersCollection.updateOne({ _id: tokenRecord.userId }, { $set: { passwordSalt: salt, passwordHash, passwordChangedAt: new Date() } }, options);
+      if (!result.matchedCount) return false;
+      await sessionsCollection.deleteMany({ userId: tokenRecord.userId }, options);
+      await authTokensCollection.deleteMany({ userId: tokenRecord.userId }, options);
+      return true;
+    });
+    if (!changed) return res.status(400).json({ error: "This password reset link is invalid or expired." });
+    return res.json({ success: true, message: "Password updated. Sign in with your new password." });
+  } catch (error) {
+    console.error("Could not reset account password:", error.message);
+    return res.status(503).json({ error: "Could not reset your password right now. Please try again." });
   }
 });
 
@@ -487,9 +732,13 @@ app.delete("/api/auth/account", requireAuth, async (req, res) => {
     if (expected.length !== candidate.length || !timingSafeEqual(expected, candidate)) {
       return res.status(401).json({ error: "Password is incorrect." });
     }
-    await reviewsCollection?.deleteMany({ userId: user._id });
-    await sessionsCollection.deleteMany({ userId: user._id });
-    await usersCollection.deleteOne({ _id: user._id });
+    await withPublicTransaction(async (session) => {
+      const options = session ? { session } : {};
+      await reviewsCollection?.deleteMany({ userId: user._id }, options);
+      await sessionsCollection.deleteMany({ userId: user._id }, options);
+      await authTokensCollection?.deleteMany({ userId: user._id }, options);
+      await usersCollection.deleteOne({ _id: user._id }, options);
+    });
     clearSessionCookie(res);
     return res.json({ success: true });
   } catch (error) {
@@ -700,6 +949,8 @@ app.get("/api/health/ready", (_req, res) => {
     status: ready ? "ready" : "not_ready",
     service: "KLYRO API",
     persistence: mongoUri ? mongoStatus : "browser_only",
+    deployment: publicDeployment ? "public" : "local",
+    blockers: publicDeployment ? publicDeploymentProblems() : [],
   });
 });
 
@@ -715,6 +966,8 @@ app.get("/api/health", async (_req, res) => {
       reviewsCollection = null;
       usersCollection = null;
       sessionsCollection = null;
+      authTokensCollection = null;
+      rateLimitsCollection = null;
       await failedClient?.close().catch(() => {});
     }
   }
@@ -724,6 +977,7 @@ app.get("/api/health", async (_req, res) => {
     service: "KLYRO API",
     database: mongoUri ? mongoStatus : "browser_only",
     ready,
+    deployment: publicDeployment ? "public" : "local",
   });
 });
 
@@ -1027,26 +1281,42 @@ app.use((error, _req, res, next) => {
 });
 
 async function startServer() {
-  if (!["127.0.0.1", "localhost", "::1", "[::1]"].includes(HOST)) {
-    throw new Error("This single-user prototype only binds to localhost. Public deployment requires authentication and per-user review scoping.");
+  const loopbackHosts = ["127.0.0.1", "localhost", "::1", "[::1]"];
+  if (!publicDeployment && !loopbackHosts.includes(HOST)) {
+    throw new Error("Public binding is disabled. Set PUBLIC_DEPLOYMENT=true only after completing the required production configuration and operational checks.");
   }
-  await connectMongo();
+  if (publicDeployment) {
+    const problems = publicDeploymentProblems();
+    if (loopbackHosts.includes(HOST)) problems.push("HOST must be a public bind address when PUBLIC_DEPLOYMENT=true");
+    if (problems.length) throw new Error(`Public deployment configuration is incomplete: ${problems.join("; ")}`);
+    const connected = await connectMongo();
+    if (!connected || !readiness()) throw new Error("Public deployment requires a connected MongoDB replica set, auth token storage, and shared rate-limit storage.");
+  } else {
+    await connectMongo();
+  }
   startMongoRetry();
   app.listen(PORT, HOST, () => {
-    console.log(`KLYRO API running at http://${HOST}:${PORT}`);
+    console.log(`KLYRO API running at ${process.env.NODE_ENV === "production" ? "https" : "http"}://${HOST}:${PORT}`);
   });
 }
 
-export { app, connectMongo, resetRateLimitsForTests, setAuthCollectionsForTests, setDockerForTests, setMongoForTests, setRepairProviderForTests, setReviewsCollectionForTests, readiness };
+export { app, connectMongo, resetRateLimitsForTests, setAuthCollectionsForTests, setDockerForTests, setMongoForTests, setPublicDeploymentForTests, setRepairProviderForTests, setReviewsCollectionForTests, readiness };
 
 function setReviewsCollectionForTests(collection) {
   reviewsCollection = collection;
   mongoStatus = collection ? "connected" : MONGODB_URI ? "unavailable" : "not_configured";
 }
 
-function setAuthCollectionsForTests({ users = null, sessions = null } = {}) {
+function setAuthCollectionsForTests({ users = null, sessions = null, tokens = null, rateLimits = null } = {}) {
   usersCollection = users;
   sessionsCollection = sessions;
+  authTokensCollection = tokens;
+  rateLimitsCollection = rateLimits;
+}
+
+function setPublicDeploymentForTests(enabled = false) {
+  publicDeployment = enabled;
+  app.set("trust proxy", enabled ? 1 : false);
 }
 
 function setDockerForTests({ spawn: spawnFunction, timeoutMs } = {}) {
@@ -1065,6 +1335,8 @@ function setMongoForTests({ uri = MONGODB_URI, clientFactory } = {}) {
   reviewsCollection = null;
   usersCollection = null;
   sessionsCollection = null;
+  authTokensCollection = null;
+  rateLimitsCollection = null;
   mongoStatus = mongoUri ? "unavailable" : "not_configured";
 }
 

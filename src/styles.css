@@ -3359,6 +3359,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .auth-spinner { animation:auth-spin .8s linear infinite; }
 @keyframes auth-spin { to { transform:rotate(360deg); } }
 .auth-error { margin:0; padding:10px; color:#f0b6bd; background:rgba(179,65,80,.12); border:1px solid rgba(179,65,80,.28); border-radius:6px; font-size:11px; line-height:1.5; }
+.auth-notice { margin:0; padding:10px; color:var(--theme-text); background:rgba(78,126,201,.12); border:1px solid rgba(78,126,201,.3); border-radius:6px; font-size:11px; line-height:1.5; }
+.auth-secondary-actions { display:flex; justify-content:center; flex-wrap:wrap; gap:6px 14px; margin-top:12px; }
+.auth-link-button { padding:0; color:var(--theme-muted); background:none; border:0; cursor:pointer; font:inherit; font-size:11px; }
+.auth-link-button:hover { color:var(--theme-text); text-decoration:underline; }
+.auth-link-button:disabled { cursor:wait; opacity:.6; }
 .auth-switch { display:flex; flex-wrap:wrap; justify-content:center; gap:5px; margin:18px 0 0; color:var(--theme-muted); font-size:11px; }
 .auth-switch button { padding:0; color:var(--theme-text); background:none; border:0; cursor:pointer; font:inherit; font-size:inherit; font-weight:600; }
 .auth-storage-note { margin:15px 0 0; color:var(--theme-muted); text-align:center; font-size:9px; line-height:1.5; }
