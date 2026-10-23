@@ -91,9 +91,10 @@ let rateLimitsCollection = null;
 let emailFetch = globalThis.fetch;
 let publicInitialization = null;
 
-function publicDeploymentProblems() {
-  if (!publicDeployment) return [];
+function publicDeploymentProblems(includeWhenDisabled = false) {
+  if (!publicDeployment && !includeWhenDisabled) return [];
   const problems = [];
+  if (!publicDeployment) problems.push("PUBLIC_DEPLOYMENT must be true in the Vercel Production environment");
   if (process.env.NODE_ENV !== "production") problems.push("NODE_ENV must be production");
   if (!MONGODB_URI || MONGODB_URI.includes("<")) problems.push("MONGODB_URI must point to the production MongoDB database");
   if (!PUBLIC_APP_URL) problems.push("PUBLIC_APP_URL must be the HTTPS app origin");
@@ -1322,13 +1323,7 @@ async function preparePublicDeployment() {
 }
 
 function getPublicDeploymentDiagnostics() {
-  if (!publicDeployment) {
-    return {
-      ready: false,
-      blockers: ["Set PUBLIC_DEPLOYMENT=true in the Vercel Production environment."],
-    };
-  }
-  const blockers = publicDeploymentProblems();
+  const blockers = publicDeploymentProblems(true);
   if (mongoStatus !== "connected" || !usersCollection || !sessionsCollection || !authTokensCollection || !rateLimitsCollection) {
     blockers.push("MongoDB is unavailable or its required account and shared rate-limit collections are not ready. Check MONGODB_URI, database network access, and the deployment logs.");
   }

@@ -6,6 +6,8 @@ for (const name of ["npm_config_cache_dir", "NPM_CONFIG_CACHE_DIR", "npm_config_
   delete npmEnvironment[name];
 }
 
+console.log(`KLYRO Vercel install script active (Node ${process.version}); removed deprecated npm cache-dir environment config.`);
+
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
 for (const args of [["install"], ["install", "--prefix", "server"]]) {
   const result = spawnSync(npmCommand, args, {
